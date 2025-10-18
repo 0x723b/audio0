@@ -12,7 +12,7 @@ import type { Promisable } from '@subframe7536/type-utils'
 import { Mitt } from 'zen-mitt/class'
 
 import { ZAudioError } from './types'
-import { bindEventListenerWithCleanup, clamp, formatVolume, getCodecs, sleep } from './utils/common'
+import { clamp, formatVolume, getCodecs, sleep } from './utils/common'
 
 // Keep order
 const sessionEvents = [
@@ -25,51 +25,36 @@ const sessionEvents = [
   'seekto',
   'stop',
 ] as const
+
 type EventIndex = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7
 
 /**
- * Audio player class with fade effects and media session support
- *
- * @example
- * ```ts
- * const audio = new ZAudio();
- * await audio.load({ src: 'audio.mp3' });
- * await audio.play();
- * ```
- *
- * @remarks
- * This class provides the following features:
- * - Audio playback control (play, pause, stop, seek)
- * - Volume control with fade effects
- * - Media session integration
- * - Custom audio node handling
- * - Codec support detection
- * - Event emission for various audio states
- *
- * @event load - Emitted when audio is loaded successfully
- * @event play - Emitted when audio starts playing
- * @event pause - Emitted when audio is paused
- * @event stop - Emitted when audio is stopped
- * @event ended - Emitted when audio playback ends
- * @event error - Emitted when an error occurs
- * @event timeupdate - Emitted when playback time updates
- * @event volume - Emitted when volume changes
- * @event mute - Emitted when mute state changes
- * @event rate - Emitted when playback rate changes
- * @event seek - Emitted when seeking to a specific time
+ * Audio player class with fade effects and media session support built on top of AudioContext
  */
 export class ZAudio<T extends ZAudioEvents = ZAudioEvents> extends Mitt<T> {
   private ctx: AudioContext | undefined
-  private sourceNode: MediaElementAudioSourceNode | undefined
   private gainNode: GainNode | undefined
+  private buffer: AudioBuffer | undefined
+  private sourceNode: AudioBufferSourceNode | undefined
   private nodes: AudioNode[] = []
-  protected cleanup: VoidFunction[] = []
-  protected isEnding = false
+  private startTimestamp: number | undefined
+  private offset = 0
+  private timeUpdateTimer: ReturnType<typeof setInterval> | null = null
+  private _playbackRate = 1
+  private _muted = false
+
   protected options: Required<Omit<ZAudioOptions, 'mediaSession'>>
+  protected isEnding = false
   protected ses: MediaSession | undefined
+
+  /**
+   * @deprecated HTMLAudioElement is no longer used internally. This property will remain `undefined`.
+   */
+  public audio: HTMLAudioElement | undefined
+
   public codecs: Codecs
-  public audio: HTMLAudioElement = new Audio()
   public state: LoadingState = 'empty'
+
   public constructor(options: ZAudioOptions = {}) {
     super()
     this.codecs = getCodecs()
@@ -77,37 +62,27 @@ export class ZAudio<T extends ZAudioEvents = ZAudioEvents> extends Mitt<T> {
       fadeDuration: 500,
       volume: 0.5,
       timeout: 10000,
-      // @ts-expect-error polyfill
-      getAudioContext: () => new (globalThis.AudioContext || globalThis.webkitAudioContext)(),
+      getAudioContext: () => {
+        const AudioContextCtor = globalThis.AudioContext || (globalThis as any).webkitAudioContext
+        if (!AudioContextCtor) {
+          throw new Error('AudioContext is not available in this environment')
+        }
+        return new AudioContextCtor()
+      },
       extraAudioNodes: () => [],
       ...options,
     }
 
-    this.ses = options.mediaSession ? navigator?.mediaSession : undefined
+    this.audio = undefined
+
+    this.ses = options.mediaSession ? globalThis.navigator?.mediaSession : undefined
 
     this.bindSession(2, () => this.play())
     this.bindSession(1, () => this.pause())
     this.bindSession(7, () => this.stop())
-    this.bindSession(6, detail => detail.seekTime && this.seek(detail.seekTime))
-    this.bindSession(5, detail => detail.seekOffset && this.seek(this.currentTime + detail.seekOffset))
-    this.bindSession(4, detail => detail.seekOffset && this.seek(this.currentTime - detail.seekOffset))
-    this.bindListener('ended', () => this.emit('ended'))
-    this.bindListener('timeupdate', () => {
-      this.ses?.setPositionState?.({
-        duration: this.duration,
-        position: this.currentTime,
-        playbackRate: this.playbackRate,
-      })
-
-      this.emit('timeupdate', this.currentTime)
-      if (this.fadeDuration > 0 && !this.isEnding) {
-        const targetFadeDuration = (this.duration - this.currentTime) * 1e3
-        if (targetFadeDuration < this.fadeDuration) {
-          this.isEnding = true
-          this.fade(this.gainNode!.gain.value, 0, targetFadeDuration)
-        }
-      }
-    })
+    this.bindSession(6, detail => detail.seekTime != null && this.seek(detail.seekTime))
+    this.bindSession(5, detail => detail.seekOffset != null && this.seek(this.currentTime + detail.seekOffset))
+    this.bindSession(4, detail => detail.seekOffset != null && this.seek(this.currentTime - detail.seekOffset))
   }
 
   /**
@@ -116,21 +91,21 @@ export class ZAudio<T extends ZAudioEvents = ZAudioEvents> extends Mitt<T> {
    * or Infinity if the media resource is streaming.
    */
   get duration(): number {
-    return this.audio.duration
+    return this.buffer?.duration ?? 0
   }
 
   /**
    * Get a flag that specifies whether playback is playing.
    */
   get isPlaying(): boolean {
-    return !this.audio.paused
+    return !!this.sourceNode
   }
 
   /**
    * Get the current playback position, in seconds.
    */
   get currentTime(): number {
-    return this.audio.currentTime
+    return this.computeCurrentTime()
   }
 
   /**
@@ -138,17 +113,37 @@ export class ZAudio<T extends ZAudioEvents = ZAudioEvents> extends Mitt<T> {
    * This speed is expressed as a multiple of the normal speed of the media resource.
    */
   get playbackRate(): number {
-    return this.audio.playbackRate
+    return this._playbackRate
   }
 
   /**
    * Set the current rate of speed for the media resource to play.
    * This speed is expressed as a multiple of the normal speed of the media resource.
    *
-   * Emit `"rate"` event
+   * Emit "rate" event
    */
   set playbackRate(rate: number) {
-    this.audio.playbackRate = rate
+    if (!Number.isFinite(rate) || rate <= 0) {
+      rate = 1
+    }
+
+    if (rate === this._playbackRate) {
+      return
+    }
+
+    const ctx = this.ctx
+    if (ctx && this.sourceNode && this.startTimestamp !== undefined) {
+      const currentPosition = this.computeCurrentTime(ctx.currentTime)
+      this.offset = clamp(0, currentPosition, this.duration)
+      this.startTimestamp = ctx.currentTime
+    }
+
+    this._playbackRate = rate
+
+    if (ctx && this.sourceNode) {
+      this.sourceNode.playbackRate.setValueAtTime(rate, ctx.currentTime)
+    }
+
     this.emit('rate', rate)
   }
 
@@ -164,32 +159,35 @@ export class ZAudio<T extends ZAudioEvents = ZAudioEvents> extends Mitt<T> {
    * Set the current volume for the media resource to play.
    * The value is between 0 and 1.
    *
-   * Emit `"volume"` event
+   * Emit "volume" event
    */
   set volume(volume: number) {
     volume = formatVolume(volume)
     this.options.volume = volume
-    this.setVolume(volume)
+    if (!this._muted) {
+      this.setVolume(volume)
+    }
     this.emit('volume', volume)
   }
 
   /**
-   * Get a flag that indicates whether the audio
-   * (either audio or the audio track on video media) is muted.
+   * Get a flag that indicates whether the audio is muted.
    */
   get muted(): boolean {
-    return this.audio.muted
+    return this._muted
   }
 
   /**
-   * Set a flag that indicates whether the audio
-   * (either audio or the audio track on video media) is muted.
+   * Set a flag that indicates whether the audio is muted.
    *
-   * Emit `"muted"` event
+   * Emit "muted" event
    */
   set muted(muted: boolean) {
-    this.options.volume = muted ? 0 : this.audio.volume
-    this.audio.muted = muted
+    if (this._muted === muted) {
+      return
+    }
+    this._muted = muted
+    this.setVolume(muted ? 0 : this.options.volume)
     this.emit('mute', muted)
   }
 
@@ -208,17 +206,9 @@ export class ZAudio<T extends ZAudioEvents = ZAudioEvents> extends Mitt<T> {
     this.emit('fadeDuration', duration)
   }
 
-  private setVolume(v: number): number {
-    const currentTime = this.ctx!.currentTime
-    this.gainNode!
-      .gain
-      .cancelScheduledValues(currentTime)
-      .setValueAtTime(v, currentTime)
-    return currentTime
-  }
-
   protected emitError(msg: string, code: ZAudioErrorCode = -1): false {
     this.state = 'error'
+    this.stopTimeUpdates()
     this.emit('error', new ZAudioError(code, msg), code)
     return false
   }
@@ -231,27 +221,6 @@ export class ZAudio<T extends ZAudioEvents = ZAudioEvents> extends Mitt<T> {
   }
 
   /**
-   * Bind event listener
-   * @param event event name
-   * @param handler event listener
-   */
-  protected bindListener(event: keyof HTMLMediaElementEventMap, handler: EventListener): void {
-    this.cleanup.push(bindEventListenerWithCleanup(this.audio, event, handler))
-  }
-
-  public handleContext(
-    fn: (
-      ctx: AudioContext,
-      nodes: AudioNode[]
-    ) => AudioNode[] | undefined | void | null,
-  ): void
-  public handleContext(
-    fn: (
-      ctx: AudioContext,
-      nodes: AudioNode[]
-    ) => Promise<AudioNode[] | undefined | void | null>,
-  ): Promise<void>
-  /**
    * Handle audio context and nodes. If return value is audio nodes, reconnect them to destination
    *
    * Do nothing if AudioContext is not created
@@ -260,39 +229,22 @@ export class ZAudio<T extends ZAudioEvents = ZAudioEvents> extends Mitt<T> {
   public handleContext(
     fn: (
       ctx: AudioContext,
-      nodes: AudioNode[]
+      nodes: AudioNode[],
     ) => Promisable<AudioNode[] | undefined | void | null>,
   ): Promisable<void> {
-    if (!this.ctx) {
+    if (!this.ctx || !this.gainNode) {
       return
     }
 
-    const reconnectNodes = (
-      nodes: AudioNode[] | undefined | void | null,
-    ): void => {
-      if (!nodes) {
+    const result = fn(this.ctx, [...this.nodes])
+    const apply = (nodes?: AudioNode[] | null | void): void => {
+      if (nodes == null) {
         return
       }
-
-      this.sourceNode!.disconnect()
-      this.nodes.forEach(node => node.disconnect())
-
-      if (!nodes.length) {
-        this.sourceNode!.connect(this.gainNode!)
-        this.nodes = []
-        return
-      }
-
-      this.sourceNode!.connect(nodes[0])
-      nodes.reduce((prev, curr) => (prev.connect(curr), curr))
-      nodes[nodes.length - 1].connect(this.gainNode!)
-      this.nodes = nodes
+      this.setNodes(nodes)
     }
 
-    const result = fn(this.ctx, [...this.nodes])
-    return result instanceof Promise
-      ? result.then(reconnectNodes)
-      : reconnectNodes(result)
+    return result instanceof Promise ? result.then(apply) : apply(result)
   }
 
   /**
@@ -302,82 +254,72 @@ export class ZAudio<T extends ZAudioEvents = ZAudioEvents> extends Mitt<T> {
    */
   public async load(metadata: ParsedTrackInfo, options: LoadOptions = {}): Promise<boolean> {
     const autoPlay = options.autoPlay ?? this.isPlaying
+
     if (this.isPlaying) {
       await this.stop()
+    } else {
+      this.stopSource()
+      this.stopTimeUpdates()
     }
 
-    const newSrc = metadata.src
-    const ext = newSrc.split('?', 1)[0].match(/\.([^.]+)$/)?.[1]
-      || options.mimeType?.split('/')[1]?.split(';')[0]
-      || newSrc.match(/^data:audio\/([^;]+);/i)?.[1]
-
-    if (!ext || !this.codecs.has(ext.toLowerCase())) {
-      return this.emitError(`MIMETYPE ${ext} is unsupported`)
+    let ctx: AudioContext
+    try {
+      ctx = this.ensureContext()
+    } catch (error) {
+      return this.emitError(
+        error instanceof Error ? error.message : String(error),
+      )
     }
-
-    if (!this.ctx) {
-      this.ctx = this.options.getAudioContext()
-      this.gainNode = this.ctx.createGain()
-      this.gainNode.gain.setValueAtTime(this.volume, this.ctx.currentTime)
-      this.sourceNode = this.ctx.createMediaElementSource(this.audio)
-      this.gainNode.connect(this.ctx.destination)
-      this.handleContext((ctx) => {
-        const nodes = this.options.extraAudioNodes(ctx)
-        return Array.isArray(nodes) ? nodes : nodes()
-      })
-      this.setVolume(this.volume)
-    }
-    await this.ctx.suspend()
 
     this.state = 'loading'
     this.isEnding = false
+    this.buffer = undefined
 
-    let _cleanup: VoidFunction | undefined
-    const loadResult = await new Promise<boolean>((resolve) => {
-      let _timeout = this.options.timeout
-      const timeoutId = setTimeout(() => {
-        _cleanup?.()
-        resolve(
-          this.emitError(`Loading audio ${newSrc} timeout after ${_timeout}ms`, 2),
-        )
-      }, _timeout)
-      const cleanup1 = bindEventListenerWithCleanup(this.audio, 'canplay', () => resolve(true))
-      const cleanup2 = bindEventListenerWithCleanup(this.audio, 'error', () => {
-        this.state = 'error'
-        resolve(
-          this.emitError(
-            this.audio.error?.message || 'Unknown audio error',
-            (this.audio.error?.code || 0) as ZAudioErrorCode,
-          ),
-        )
-      })
-      _cleanup = () => {
-        cleanup1()
-        cleanup2()
-        clearTimeout(timeoutId)
+    const ext = this.extractExtension(metadata.src, options.mimeType)
+    if (ext && !this.codecs.has(ext.toLowerCase())) {
+      return this.emitError(`MIMETYPE ${ext} is unsupported`)
+    }
+
+    const shouldCloneBuffer = Boolean(options.arrayBuffer)
+    let arrayBuffer: ArrayBuffer
+    try {
+      arrayBuffer = await this.resolveArrayBuffer(metadata, options)
+    } catch (error) {
+      if (error instanceof ZAudioError) {
+        return this.emitError(error.message, error.code)
       }
-      this.audio.src = newSrc
-      this.audio.crossOrigin = 'anonymous'
-      this.audio.load()
-    }).catch(e => this.emitError(e.toString(), 0))
-    _cleanup?.()
-
-    if (!loadResult) {
-      return false
+      const err = error as Error
+      if ((err as DOMException)?.name === 'AbortError') {
+        return this.emitError(
+          `Loading audio ${metadata.src ?? '[stream]'} timeout after ${this.options.timeout}ms`,
+          2,
+        )
+      }
+      return this.emitError(err.message || 'Unknown audio error', 0)
     }
-    this.emit('load', metadata)
 
-    if (this.ses) {
-      this.ses.metadata = new MediaMetadata(metadata)
+    try {
+      const decoded = await ctx.decodeAudioData(shouldCloneBuffer ? arrayBuffer.slice(0) : arrayBuffer)
+      this.buffer = decoded
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      return this.emitError(`Failed to decode audio data, ${message}`, 0)
     }
+
+    const startOffset = clamp(0, options.startTime ?? 0, this.duration)
+    this.offset = startOffset
+    this.startTimestamp = undefined
     this.state = 'loaded'
+    this.isEnding = false
+    this.setVolume(this._muted ? 0 : this.options.volume)
+    this.updateSessionMetadata(metadata)
+    this.emit('load', metadata)
+    this.emitTimeUpdate(this.offset)
+
     if (autoPlay) {
-      if (options.startTime) {
-        await this.seek(options.startTime)
-      }
       return await this.play()
     }
-    return loadResult
+    return true
   }
 
   /**
@@ -387,24 +329,28 @@ export class ZAudio<T extends ZAudioEvents = ZAudioEvents> extends Mitt<T> {
     if (this.isPlaying) {
       return true
     }
-    if (!this.ctx || this.state !== 'loaded') {
+
+    if (!this.ctx || !this.buffer || this.state !== 'loaded') {
       return false
     }
+
     try {
       if (this.ctx.state === 'suspended' || this.ctx.state === 'interrupted') {
         await this.ctx.resume()
       }
+
       this.isEnding = false
       this.setVolume(0)
+      this.startSource(this.offset)
       if (this.ses) {
         this.ses.playbackState = 'playing'
       }
-      await this.audio.play()
       this.emit('play')
-      await this.fade(0, this.volume)
+      await this.fade(0, this._muted ? 0 : this.options.volume)
       return true
-    } catch (e) {
-      return this.emitError(`Failed to play audio, ${e}`)
+    } catch (error) {
+      this.stopSource()
+      return this.emitError(`Failed to play audio, ${error instanceof Error ? error.message : error}`)
     }
   }
 
@@ -415,12 +361,18 @@ export class ZAudio<T extends ZAudioEvents = ZAudioEvents> extends Mitt<T> {
     if (!this.isPlaying) {
       return
     }
-    await this.fade(this.volume, 0)
+
+    const currentGain = this.getCurrentGain()
+    await this.fade(currentGain, 0)
+    const position = this.computeCurrentTime()
+    this.stopSource()
+    this.offset = clamp(0, position, this.duration)
+    this.stopTimeUpdates()
+    this.isEnding = false
     if (this.ses) {
       this.ses.playbackState = 'paused'
     }
-    await this.ctx?.suspend()
-    this.audio.pause()
+    this.emitTimeUpdate(this.offset)
     this.emit('pause')
   }
 
@@ -429,13 +381,14 @@ export class ZAudio<T extends ZAudioEvents = ZAudioEvents> extends Mitt<T> {
    */
   public async stop(): Promise<void> {
     await this.pause()
-    this.audio.currentTime = 0
+    this.offset = 0
+    this.buffer = undefined
+    this.state = 'empty'
+    this.isEnding = false
     if (this.ses) {
       this.ses.playbackState = 'none'
     }
-    this.audio.src = ''
-    this.audio.load()
-    this.state = 'empty'
+    this.emitTimeUpdate(0)
     this.emit('stop')
   }
 
@@ -443,17 +396,30 @@ export class ZAudio<T extends ZAudioEvents = ZAudioEvents> extends Mitt<T> {
    * Seek audio to specific time
    */
   public async seek(time: number): Promise<void> {
-    time = clamp(0, time, this.duration)
-    if (!this.isPlaying) {
-      this.audio.currentTime = time
+    if (!this.buffer) {
       return
     }
-    const vol = this.volume
-    const dur = this.fadeDuration / 2
-    await this.fade(vol, vol / 2, dur)
-    this.audio.currentTime = time
-    this.emit('seek', time)
-    await this.fade(vol / 2, vol, dur)
+
+    const target = clamp(0, time, this.duration)
+    this.isEnding = false
+
+    if (!this.isPlaying) {
+      this.offset = target
+      this.emitTimeUpdate(this.offset)
+      return
+    }
+
+    const currentGain = this.getCurrentGain()
+    const fadeHalfDuration = this.fadeDuration / 2
+    const midGain = currentGain / 2
+
+    await this.fade(currentGain, midGain, fadeHalfDuration)
+    this.stopSource()
+    this.offset = target
+    this.emit('seek', target)
+    this.emitTimeUpdate(this.offset)
+    this.startSource(this.offset)
+    await this.fade(midGain, this._muted ? 0 : this.options.volume, fadeHalfDuration)
   }
 
   /**
@@ -464,12 +430,19 @@ export class ZAudio<T extends ZAudioEvents = ZAudioEvents> extends Mitt<T> {
     to: number,
     fadeDuration: number = this.fadeDuration,
   ): Promise<void> {
-    if (fadeDuration <= 0) {
-      this.setVolume(to)
+    if (!this.ctx || !this.gainNode) {
       return
     }
+
+    fadeDuration = Math.max(0, fadeDuration)
+
+    if (fadeDuration <= 0) {
+      this.setVolume(formatVolume(to))
+      return
+    }
+
     const currentTime = this.setVolume(formatVolume(from))
-    this.gainNode?.gain.linearRampToValueAtTime(
+    this.gainNode.gain.linearRampToValueAtTime(
       formatVolume(to),
       currentTime + fadeDuration / 1e3,
     )
@@ -481,18 +454,292 @@ export class ZAudio<T extends ZAudioEvents = ZAudioEvents> extends Mitt<T> {
    */
   public async destroy(): Promise<void> {
     await this.pause()
+    this.stopSource()
+    this.stopTimeUpdates()
     await this.ctx?.close()
+
+    const ses = this.ses
+    if (ses) {
+      ses.playbackState = 'none'
+      sessionEvents.forEach(event => ses.setActionHandler(event, null))
+    }
+
+    this.nodes.forEach(node => node.disconnect())
+    this.nodes = []
+    this.buffer = undefined
+    this.gainNode?.disconnect()
+    this.gainNode = undefined
+    this.ctx = undefined
+    this.offset = 0
+    this.startTimestamp = undefined
+    this.audio = undefined
+    this.state = 'empty'
+    this.off()
+  }
+
+  private ensureContext(): AudioContext {
+    if (this.ctx) {
+      return this.ctx
+    }
+
+    const ctx = this.options.getAudioContext()
+    this.ctx = ctx
+    this.gainNode = ctx.createGain()
+    this.gainNode.connect(ctx.destination)
+
+    const extra = this.options.extraAudioNodes(ctx)
+    if (Array.isArray(extra)) {
+      this.setNodes(extra)
+    } else {
+      this.setNodes(extra?.())
+    }
+
+    this.setVolume(this._muted ? 0 : this.options.volume)
+    return ctx
+  }
+
+  private setVolume(value: number): number {
+    if (!this.ctx || !this.gainNode) {
+      return 0
+    }
+    const currentTime = this.ctx.currentTime
+    this.gainNode.gain.cancelScheduledValues(currentTime)
+    this.gainNode.gain.setValueAtTime(formatVolume(value), currentTime)
+    return currentTime
+  }
+
+  private getCurrentGain(): number {
+    if (this.gainNode) {
+      return this.gainNode.gain.value
+    }
+    return this._muted ? 0 : this.options.volume
+  }
+
+  private computeCurrentTime(referenceTime: number = this.ctx?.currentTime ?? 0): number {
+    const duration = this.duration
+    if (!this.buffer || duration <= 0) {
+      return 0
+    }
+
+    if (!this.sourceNode || this.startTimestamp === undefined) {
+      return clamp(0, this.offset, duration)
+    }
+
+    const elapsed = (referenceTime - this.startTimestamp) * this._playbackRate
+    return clamp(0, this.offset + elapsed, duration)
+  }
+
+  private startSource(offset: number): void {
+    if (!this.ctx || !this.buffer || !this.gainNode) {
+      throw new Error('Audio buffer is not loaded')
+    }
+
+    const maxOffset = this.duration > 0 ? Math.max(this.duration - 1e-6, 0) : 0
+    const startOffset = clamp(0, offset, maxOffset)
+
+    this.stopSource()
+
+    const source = this.ctx.createBufferSource()
+    source.buffer = this.buffer
+    source.playbackRate.setValueAtTime(this._playbackRate, this.ctx.currentTime)
+    source.onended = () => this.handleSourceEnded(source)
+
+    this.connectSourceNode(source)
+    source.start(0, startOffset)
+
+    this.sourceNode = source
+    this.offset = startOffset
+    this.startTimestamp = this.ctx.currentTime
+    this.startTimeUpdates()
+  }
+
+  private stopSource(): void {
+    if (!this.sourceNode) {
+      return
+    }
+
+    const source = this.sourceNode
+    source.onended = null
+    try {
+      source.stop()
+    } catch {
+      // ignore stop errors on already stopped sources
+    }
+    source.disconnect()
+    if (this.sourceNode === source) {
+      this.sourceNode = undefined
+    }
+    this.startTimestamp = undefined
+  }
+
+  private handleSourceEnded(source: AudioBufferSourceNode): void {
+    if (this.sourceNode === source) {
+      this.sourceNode = undefined
+    }
+    this.startTimestamp = undefined
+    this.offset = this.duration
+    this.stopTimeUpdates()
+    this.isEnding = false
     if (this.ses) {
       this.ses.playbackState = 'none'
-      sessionEvents.forEach(e => this.ses!.setActionHandler(e, null))
     }
-    this.cleanup.forEach(c => c())
-    this.cleanup = null!
-    this.nodes?.forEach(n => n.disconnect())
-    this.nodes = null!
-    this.audio = null!
-    this.ctx = null!
-    this.gainNode = null!
-    this.off()
+    this.emitTimeUpdate(this.offset)
+    this.emit('ended')
+  }
+
+  private connectSourceNode(source: AudioNode): void {
+    if (!this.gainNode) {
+      return
+    }
+
+    if (!this.nodes.length) {
+      source.connect(this.gainNode)
+      return
+    }
+
+    source.connect(this.nodes[0])
+  }
+
+  private setNodes(nodes: AudioNode[] | undefined | null): void {
+    if (!this.gainNode) {
+      this.nodes = []
+      return
+    }
+
+    this.nodes.forEach(node => node.disconnect())
+    if (!nodes || !nodes.length) {
+      this.nodes = []
+      if (this.sourceNode) {
+        this.sourceNode.disconnect()
+        this.sourceNode.connect(this.gainNode)
+      }
+      return
+    }
+
+    nodes.forEach(node => node.disconnect())
+    for (let i = 0; i < nodes.length - 1; i++) {
+      nodes[i].connect(nodes[i + 1])
+    }
+    nodes[nodes.length - 1].connect(this.gainNode)
+    this.nodes = [...nodes]
+
+    if (this.sourceNode) {
+      this.sourceNode.disconnect()
+      this.connectSourceNode(this.sourceNode)
+    }
+  }
+
+  private startTimeUpdates(): void {
+    this.stopTimeUpdates()
+    this.handleTimeUpdate()
+    this.timeUpdateTimer = setInterval(() => this.handleTimeUpdate(), 200)
+  }
+
+  private stopTimeUpdates(): void {
+    if (this.timeUpdateTimer !== null) {
+      clearInterval(this.timeUpdateTimer)
+      this.timeUpdateTimer = null
+    }
+  }
+
+  private handleTimeUpdate(): void {
+    if (!this.buffer) {
+      return
+    }
+    const position = this.computeCurrentTime()
+    this.emitTimeUpdate(position)
+
+    if (this.fadeDuration > 0 && !this.isEnding) {
+      const remaining = (this.duration - position) * 1e3
+      if (remaining > 0 && remaining < this.fadeDuration) {
+        this.isEnding = true
+        void this.fade(this.getCurrentGain(), 0, remaining)
+      }
+    }
+  }
+
+  private emitTimeUpdate(position: number): void {
+    this.updateSessionPosition(position)
+    this.emit('timeupdate', position)
+  }
+
+  private updateSessionPosition(position: number): void {
+    if (!this.ses?.setPositionState) {
+      return
+    }
+    this.ses.setPositionState({
+      duration: this.duration,
+      position,
+      playbackRate: this._playbackRate,
+    })
+  }
+
+  private updateSessionMetadata(metadata: ParsedTrackInfo): void {
+    if (!this.ses || typeof MediaMetadata === 'undefined') {
+      return
+    }
+    this.ses.metadata = new MediaMetadata(metadata)
+  }
+
+  private extractExtension(src: string | undefined, mimeType?: string): string | undefined {
+    const normalizedSrc = src ?? ''
+    const pathMatch = normalizedSrc.split('?', 1)[0].match(/\.([^.]+)$/)?.[1]
+    if (pathMatch) {
+      return pathMatch.toLowerCase()
+    }
+
+    if (mimeType) {
+      const type = mimeType.split('/')[1]?.split(';')[0]
+      if (type) {
+        return type.toLowerCase()
+      }
+    }
+
+    const dataMatch = normalizedSrc.match(/^data:audio\/([^;]+);/i)?.[1]
+    return dataMatch?.toLowerCase()
+  }
+
+  private async resolveArrayBuffer(metadata: ParsedTrackInfo, options: LoadOptions): Promise<ArrayBuffer> {
+    if (options.arrayBuffer) {
+      return options.arrayBuffer
+    }
+    if (options.stream) {
+      try {
+        return await new Response(options.stream).arrayBuffer()
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        throw new ZAudioError(5, `Stream error: ${message}`)
+      }
+    }
+
+    if (!metadata.src) {
+      throw new TypeError('No audio source provided')
+    }
+
+    if (typeof fetch !== 'function') {
+      throw new ReferenceError('Global fetch is not available in this environment')
+    }
+
+    const timeout = this.options.timeout
+    const controller = timeout > 0 && typeof AbortController !== 'undefined'
+      ? new AbortController()
+      : undefined
+    let timer: ReturnType<typeof setTimeout> | undefined
+
+    if (controller) {
+      timer = setTimeout(() => controller.abort(), timeout)
+    }
+
+    try {
+      const response = await fetch(metadata.src, controller ? { signal: controller.signal } : undefined)
+      if (!response.ok) {
+        throw new Error(`Failed to load audio ${metadata.src}, status ${response.status}`)
+      }
+      return await response.arrayBuffer()
+    } finally {
+      if (timer !== undefined) {
+        clearTimeout(timer)
+      }
+    }
   }
 }

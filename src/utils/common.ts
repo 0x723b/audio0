@@ -2,10 +2,25 @@
 import type { Codecs } from '../types'
 
 export function getCodecs(): Codecs {
+  if (typeof globalThis.Audio !== 'function') {
+    return new Set([
+      'mp3',
+      'mpeg',
+      'opus',
+      'ogg',
+      'aac',
+      'm4a',
+      'mp4',
+      'webm',
+      'wav',
+      'flac',
+    ])
+  }
+
   let testAudio = new Audio()
   const checkAudioMime = (mime: string): boolean => !!testAudio.canPlayType('audio/' + mime)
 
-  const ua = globalThis.navigator.userAgent
+  const ua = globalThis.navigator?.userAgent ?? ''
   const isSafari = ua.includes('Safari') && !ua.includes('Chrome')
   const safariVersion = ua.match(/Version\/(.*?) /)
   const isOldSafari = isSafari && safariVersion && Number.parseInt(safariVersion[1]) < 16

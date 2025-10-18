@@ -10,9 +10,7 @@ import type {
 
 import { ZAudio } from './audio'
 import { LOOP_MODE } from './types'
-import { useArrayBuffer } from './utils/buffer'
 import { defaultShuffle } from './utils/shuffle'
-import { useStream } from './utils/stream'
 
 export class ZPlayer extends ZAudio<ZPlayerEvents> {
   private currentIndex = 0
@@ -20,7 +18,6 @@ export class ZPlayer extends ZAudio<ZPlayerEvents> {
   private _trackList: TrackLike[] = []
   private _loopMode: number = 0
   public shuffleFn: ShuffleFn = defaultShuffle
-  private streamCleanup?: () => void
 
   constructor(config: ZPlayerOptions = {}) {
     const { autoNext, trackList, shuffleFn, loopMode = 'list', ...audioConfig } = config
@@ -119,35 +116,31 @@ export class ZPlayer extends ZAudio<ZPlayerEvents> {
       return false
     }
 
-    // Cleanup previous stream if needed
-    this.streamCleanup?.()
-    this.streamCleanup = undefined
-
     let info: ParsedTrackInfo
     const mimeType = track.mimeType || ''
+    const baseOptions: LoadOptions = { mimeType, ...(options || {}) }
+    let loadOptions: LoadOptions = baseOptions
 
     switch (track.type) {
       case 'stream': {
-        const [src, cleanup] = useStream(
-          await track.src(),
-          mimeType,
-          err => this.emitError(err, 5),
-        )
-        this.streamCleanup = cleanup
-        info = { ...track, src }
+        const stream = await track.src()
+        const descriptor = track.title || track.album || mimeType || track.type || 'stream'
+        info = { ...track, src: descriptor } as ParsedTrackInfo
+        loadOptions = { ...baseOptions, stream }
         break
       }
       case 'buffer': {
-        const [src, cleanup] = useArrayBuffer(await track.src(), mimeType)
-        this.streamCleanup = cleanup
-        info = { ...track, src }
+        const arrayBuffer = await track.src()
+        const descriptor = track.title || track.album || mimeType || track.type || 'buffer'
+        info = { ...track, src: descriptor } as ParsedTrackInfo
+        loadOptions = { ...baseOptions, arrayBuffer }
         break
       }
       default: {
-        info = track
+        info = track as ParsedTrackInfo
       }
     }
-    const result = await super.load(info, { mimeType, ...options })
+    const result = await super.load(info, loadOptions)
     if (result) {
       this.emit('loadTrack', this.currentIndex, info)
     }
@@ -169,7 +162,6 @@ export class ZPlayer extends ZAudio<ZPlayerEvents> {
   }
 
   public async destroy(): Promise<void> {
-    this.streamCleanup?.()
     await super.destroy()
     this._orderList = []
     this.trackList = []

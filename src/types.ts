@@ -37,7 +37,7 @@ export interface Track extends TrackInfo {
 
 export interface StreamTrack extends TrackInfo {
   type: 'stream'
-  src: () => Promisable<ReadableStream>
+  src: () => Promisable<ReadableStream<Uint8Array> | ReadableStream>
   mimeType: string
 }
 
@@ -124,6 +124,14 @@ export type LoadOptions = {
    * @default isPlaying
    */
   autoPlay?: boolean
+  /**
+   * Preloaded audio data as an ArrayBuffer
+   */
+  arrayBuffer?: ArrayBuffer
+  /**
+   * Preloaded audio data as a ReadableStream
+   */
+  stream?: ReadableStream<Uint8Array> | ReadableStream
 }
 
 export type LoadingState = 'empty' | 'loading' | 'loaded' | 'error'
