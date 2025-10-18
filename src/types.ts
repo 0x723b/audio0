@@ -70,6 +70,11 @@ export interface ZAudioOptions {
    */
   volume?: number
   /**
+   * Whether to loop playback
+   * @default false
+   */
+  loop?: boolean
+  /**
    * Whether to bind media session
    */
   mediaSession?: boolean

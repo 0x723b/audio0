@@ -76,12 +76,15 @@ export class ZAudio<T extends ZAudioEvents = ZAudioEvents> extends Mitt<T> {
     this.options = {
       fadeDuration: 500,
       volume: 0.5,
+      loop: false,
       timeout: 10000,
       // @ts-expect-error polyfill
       getAudioContext: () => new (globalThis.AudioContext || globalThis.webkitAudioContext)(),
       extraAudioNodes: () => [],
       ...options,
     }
+
+    this.audio.loop = this.options.loop
 
     this.ses = options.mediaSession ? navigator?.mediaSession : undefined
 
@@ -100,7 +103,7 @@ export class ZAudio<T extends ZAudioEvents = ZAudioEvents> extends Mitt<T> {
       })
 
       this.emit('timeupdate', this.currentTime)
-      if (this.fadeDuration > 0 && !this.isEnding) {
+      if (this.fadeDuration > 0 && !this.isEnding && !this.audio.loop) {
         const targetFadeDuration = (this.duration - this.currentTime) * 1e3
         if (targetFadeDuration < this.fadeDuration) {
           this.isEnding = true
@@ -191,6 +194,27 @@ export class ZAudio<T extends ZAudioEvents = ZAudioEvents> extends Mitt<T> {
     this.options.volume = muted ? 0 : this.audio.volume
     this.audio.muted = muted
     this.emit('mute', muted)
+  }
+
+  /**
+   * Get a flag that indicates whether the audio will loop when it reaches the end.
+   */
+  get loop(): boolean {
+    return this.audio.loop
+  }
+
+  /**
+   * Set whether the audio will loop when it reaches the end.
+   */
+  set loop(loop: boolean) {
+    this.options.loop = loop
+    this.audio.loop = loop
+    if (loop) {
+      this.isEnding = false
+      if (this.ctx && this.gainNode) {
+        this.setVolume(this.volume)
+      }
+    }
   }
 
   /**
