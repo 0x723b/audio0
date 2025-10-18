@@ -58,6 +58,8 @@ export type ShuffleFn = (trackList: TrackInfo[]) => number[]
 
 export type Codecs = Set<string>
 
+export type ZAudioEnv = 'auto' | 'html' | 'context'
+
 export interface ZAudioOptions {
   /**
    * Fade duration
@@ -88,6 +90,13 @@ export interface ZAudioOptions {
    * @param ctx audio context
    */
   extraAudioNodes?: (ctx: AudioContext) => AudioNode[] | (() => AudioNode[])
+  /**
+   * Playback environment
+   * - 'context': pure AudioContext engine (default)
+   * - 'html': HTMLAudioElement engine
+   * - 'auto': choose based on runtime (html in browser, context otherwise)
+   */
+  env?: ZAudioEnv
 }
 
 export type ZPlayerOptions = ZAudioOptions & {

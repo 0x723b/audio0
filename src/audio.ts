@@ -11,6 +11,7 @@ import type { Promisable } from '@subframe7536/type-utils'
 
 import { Mitt } from 'zen-mitt/class'
 
+import { HtmlAudioEnv } from './env/html'
 import { ZAudioError } from './types'
 import { clamp, formatVolume, getCodecs, sleep } from './utils/common'
 
@@ -42,6 +43,8 @@ export class ZAudio<T extends ZAudioEvents = ZAudioEvents> extends Mitt<T> {
   private timeUpdateTimer: ReturnType<typeof setInterval> | null = null
   private _playbackRate = 1
   private _muted = false
+
+  private delegate?: HtmlAudioEnv<T>
 
   protected options: Required<Omit<ZAudioOptions, 'mediaSession'>>
   protected isEnding = false
@@ -75,6 +78,13 @@ export class ZAudio<T extends ZAudioEvents = ZAudioEvents> extends Mitt<T> {
 
     this.audio = undefined
 
+    const envOpt = options.env ?? 'context'
+    if (envOpt === 'html' || (envOpt === 'auto' && typeof (globalThis as any).Audio === 'function')) {
+      // Delegate to HTML env implementation
+      this.delegate = new HtmlAudioEnv<T>(this, { ...this.options, mediaSession: options.mediaSession, codecs: this.codecs })
+      return
+    }
+
     this.ses = options.mediaSession ? globalThis.navigator?.mediaSession : undefined
 
     this.bindSession(2, () => this.play())
@@ -91,6 +101,9 @@ export class ZAudio<T extends ZAudioEvents = ZAudioEvents> extends Mitt<T> {
    * or Infinity if the media resource is streaming.
    */
   get duration(): number {
+    if (this.delegate) {
+      return this.delegate.duration
+    }
     return this.buffer?.duration ?? 0
   }
 
@@ -98,6 +111,9 @@ export class ZAudio<T extends ZAudioEvents = ZAudioEvents> extends Mitt<T> {
    * Get a flag that specifies whether playback is playing.
    */
   get isPlaying(): boolean {
+    if (this.delegate) {
+      return this.delegate.isPlaying
+    }
     return !!this.sourceNode
   }
 
@@ -105,6 +121,9 @@ export class ZAudio<T extends ZAudioEvents = ZAudioEvents> extends Mitt<T> {
    * Get the current playback position, in seconds.
    */
   get currentTime(): number {
+    if (this.delegate) {
+      return this.delegate.currentTime
+    }
     return this.computeCurrentTime()
   }
 
@@ -113,6 +132,9 @@ export class ZAudio<T extends ZAudioEvents = ZAudioEvents> extends Mitt<T> {
    * This speed is expressed as a multiple of the normal speed of the media resource.
    */
   get playbackRate(): number {
+    if (this.delegate) {
+      return this.delegate.playbackRate
+    }
     return this._playbackRate
   }
 
@@ -123,6 +145,11 @@ export class ZAudio<T extends ZAudioEvents = ZAudioEvents> extends Mitt<T> {
    * Emit "rate" event
    */
   set playbackRate(rate: number) {
+    if (this.delegate) {
+      this.delegate.playbackRate = rate
+      return
+    }
+
     if (!Number.isFinite(rate) || rate <= 0) {
       rate = 1
     }
@@ -152,6 +179,9 @@ export class ZAudio<T extends ZAudioEvents = ZAudioEvents> extends Mitt<T> {
    * The value is between 0 and 1.
    */
   get volume(): number {
+    if (this.delegate) {
+      return this.delegate.volume
+    }
     return this.options.volume
   }
 
@@ -162,6 +192,10 @@ export class ZAudio<T extends ZAudioEvents = ZAudioEvents> extends Mitt<T> {
    * Emit "volume" event
    */
   set volume(volume: number) {
+    if (this.delegate) {
+      this.delegate.volume = volume
+      return
+    }
     volume = formatVolume(volume)
     this.options.volume = volume
     if (!this._muted) {
@@ -174,6 +208,9 @@ export class ZAudio<T extends ZAudioEvents = ZAudioEvents> extends Mitt<T> {
    * Get a flag that indicates whether the audio is muted.
    */
   get muted(): boolean {
+    if (this.delegate) {
+      return this.delegate.muted
+    }
     return this._muted
   }
 
@@ -183,6 +220,10 @@ export class ZAudio<T extends ZAudioEvents = ZAudioEvents> extends Mitt<T> {
    * Emit "muted" event
    */
   set muted(muted: boolean) {
+    if (this.delegate) {
+      this.delegate.muted = muted
+      return
+    }
     if (this._muted === muted) {
       return
     }
@@ -195,6 +236,9 @@ export class ZAudio<T extends ZAudioEvents = ZAudioEvents> extends Mitt<T> {
    * Get the fade duration.
    */
   get fadeDuration(): number {
+    if (this.delegate) {
+      return this.delegate.fadeDuration
+    }
     return this.options.fadeDuration
   }
 
@@ -202,6 +246,10 @@ export class ZAudio<T extends ZAudioEvents = ZAudioEvents> extends Mitt<T> {
    * Set the fade duration.
    */
   set fadeDuration(duration: number) {
+    if (this.delegate) {
+      this.delegate.fadeDuration = duration
+      return
+    }
     this.options.fadeDuration = duration
     this.emit('fadeDuration', duration)
   }
@@ -232,6 +280,11 @@ export class ZAudio<T extends ZAudioEvents = ZAudioEvents> extends Mitt<T> {
       nodes: AudioNode[],
     ) => Promisable<AudioNode[] | undefined | void | null>,
   ): Promisable<void> {
+    if (this.delegate) {
+      // @ts-expect-error delegate handles its own context
+      return this.delegate.handleContext(fn) as any
+    }
+
     if (!this.ctx || !this.gainNode) {
       return
     }
@@ -253,6 +306,10 @@ export class ZAudio<T extends ZAudioEvents = ZAudioEvents> extends Mitt<T> {
    * @param options load options
    */
   public async load(metadata: ParsedTrackInfo, options: LoadOptions = {}): Promise<boolean> {
+    if (this.delegate) {
+      return await this.delegate.load(metadata, options)
+    }
+
     const autoPlay = options.autoPlay ?? this.isPlaying
 
     if (this.isPlaying) {
@@ -326,6 +383,10 @@ export class ZAudio<T extends ZAudioEvents = ZAudioEvents> extends Mitt<T> {
    * Play audio, audio will not play when the return value is `false`
    */
   public async play(): Promise<boolean> {
+    if (this.delegate) {
+      return await this.delegate.play()
+    }
+
     if (this.isPlaying) {
       return true
     }
@@ -358,6 +419,11 @@ export class ZAudio<T extends ZAudioEvents = ZAudioEvents> extends Mitt<T> {
    * Pause audio
    */
   public async pause(): Promise<void> {
+    if (this.delegate) {
+      await this.delegate.pause()
+      return
+    }
+
     if (!this.isPlaying) {
       return
     }
@@ -380,6 +446,11 @@ export class ZAudio<T extends ZAudioEvents = ZAudioEvents> extends Mitt<T> {
    * Stop audio
    */
   public async stop(): Promise<void> {
+    if (this.delegate) {
+      await this.delegate.stop()
+      return
+    }
+
     await this.pause()
     this.offset = 0
     this.buffer = undefined
@@ -396,6 +467,11 @@ export class ZAudio<T extends ZAudioEvents = ZAudioEvents> extends Mitt<T> {
    * Seek audio to specific time
    */
   public async seek(time: number): Promise<void> {
+    if (this.delegate) {
+      await this.delegate.seek(time)
+      return
+    }
+
     if (!this.buffer) {
       return
     }
@@ -430,6 +506,11 @@ export class ZAudio<T extends ZAudioEvents = ZAudioEvents> extends Mitt<T> {
     to: number,
     fadeDuration: number = this.fadeDuration,
   ): Promise<void> {
+    if (this.delegate) {
+      await this.delegate.fade(from, to, fadeDuration)
+      return
+    }
+
     if (!this.ctx || !this.gainNode) {
       return
     }
@@ -453,6 +534,11 @@ export class ZAudio<T extends ZAudioEvents = ZAudioEvents> extends Mitt<T> {
    * Destroy instance
    */
   public async destroy(): Promise<void> {
+    if (this.delegate) {
+      await this.delegate.destroy()
+      return
+    }
+
     await this.pause()
     this.stopSource()
     this.stopTimeUpdates()
